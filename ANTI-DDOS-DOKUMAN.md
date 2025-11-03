@@ -8,11 +8,18 @@
 4. [Bad ASN Listesi](#bad-asn-listesi)
 5. [Güvenlik Doğrulama Sayfası](#güvenlik-doğrulama-sayfası)
 6. [Cookie Bypass Sistemi](#cookie-bypass-sistemi)
-7. [API Endpoints](#api-endpoints)
-8. [Rate Limiting](#rate-limiting)
-9. [Konsol Logları](#konsol-logları)
-10. [Yapılandırma](#yapılandırma)
-11. [Versiyon Notları](#versiyon-notları)
+7. [Cookie Güvenliği](#cookie-güvenliği)
+8. [Proof of Work (PoW)](#proof-of-work-pow)
+9. [Bot Detection ve Scoring](#bot-detection-ve-scoring)
+10. [CAPTCHA Fallback](#captcha-fallback)
+11. [API Endpoints](#api-endpoints)
+12. [Rate Limiting ve Cache](#rate-limiting-ve-cache)
+13. [Log Rotasyonu](#log-rotasyonu)
+14. [Güvenli IP Tespiti](#güvenli-ip-tespiti)
+15. [Otomatik ASN Güncelleme](#otomatik-asn-güncelleme)
+16. [Konsol Logları](#konsol-logları)
+17. [Yapılandırma](#yapılandırma)
+18. [Versiyon Notları](#versiyon-notları)
 
 ---
 
@@ -29,8 +36,16 @@ Akar Stresser platformu, çok katmanlı bir anti-DDoS koruma sistemi ile korunma
 - ✅ **IP Değişikliği Kontrolü**: IP değiştiğinde otomatik yeniden doğrulama
 - ✅ **ASN Değişikliği Kontrolü**: ASN değiştiğinde otomatik yeniden doğrulama
 - ✅ **VPN Tespiti**: Bad ASN tespit edildiğinde cookie'ler temizlenir ve yeniden doğrulama yapılır
+- ✅ **Cookie Güvenliği**: HttpOnly, Secure flag'leri ve AES-256 şifreleme
+- ✅ **Proof of Work (PoW)**: 8 karakterlik hash bulmacası (4 sıfır başlangıç)
+- ✅ **Bot Detection**: Browser fingerprinting, bot scoring sistemi (0-100 skor)
+- ✅ **CAPTCHA Fallback**: Bot score > 90 ise hCaptcha gösterilir
 - ✅ **Validation Endpoint**: Browser fingerprinting ve bot detection verileri toplanır
-- ✅ **Rate Limiting**: ASN lookup için API rate limiting
+- ✅ **LRU Cache**: ASN bilgileri 24 saat cache'lenir (max 10.000 entry)
+- ✅ **Log Rotasyonu**: `logs.json` maksimum 1000 kayıt tutar
+- ✅ **Güvenli IP Tespiti**: Cloudflare, Nginx proxy desteği, `x-forwarded-for` manipülasyonu önleme
+- ✅ **Otomatik ASN Güncelleme**: Her gün 02:00'de `bad_asns.json` otomatik güncellenir
+- ✅ **Rate Limiting**: ASN lookup için API rate limiting (1 saniye delay)
 
 ---
 
@@ -114,12 +129,23 @@ async function getASNFromIP(ip) {
 }
 ```
 
-### Cache Mekanizması
+### Cache Mekanizması (LRU Cache)
 
-- **Cache Süresi**: 24 saat
+- **Cache Süresi**: 24 saat (TTL)
+- **Maksimum Entry**: 10.000 IP
 - **Rate Limiting**: Request'ler arası 1 saniye bekle
 - **Timeout**: 2 saniye
-- **Localhost/Private IP**: Kontrol edilmez (otomatik bypass)
+- **Localhost/Private IP**: Sadece `127.0.0.1` ve `::1` bypass, diğer private IP'ler kontrol edilir
+
+**LRU Cache Kullanımı**:
+```javascript
+// utils/cache.js
+const { LRUCache } = require('lru-cache');
+const asnCache = new LRUCache({
+    max: 10000,
+    ttl: 24 * 60 * 60 * 1000 // 24 saat
+});
+```
 
 ---
 
@@ -139,8 +165,9 @@ Bu dosya, bilinen kötü amaçlı ASN'leri içerir:
 ### Toplam ASN Sayısı
 
 - **600+** farklı kötü ASN numarası
-- Günlük otomatik güncelleme kontrolü
-- 5 dakika cache süresi
+- **Otomatik Güncelleme**: Her gün 02:00'de `https://api.bad-asn.com/list.json` adresinden güncellenir
+- **Cron Job**: `node-cron` ile otomatik çalışır
+- Hata durumunda eski liste korunur
 
 ### Dosya Formatı
 
@@ -321,6 +348,231 @@ async function checkASNMiddleware(req, res, next) {
 
 ---
 
+## 🔐 Cookie Güvenliği
+
+### Güvenlik Flag'leri
+
+Tüm cookie'ler aşağıdaki güvenlik flag'leri ile set edilir:
+
+- **HttpOnly**: `true` - JavaScript tarafından erişilemez (XSS koruması)
+- **Secure**: `true` - Sadece HTTPS üzerinden gönderilir
+- **SameSite**: `Lax` - CSRF koruması
+
+### AES-256 Şifreleme
+
+`asn_bypass_ip` ve `asn_bypass_asn` cookie'leri şifrelenir.
+
+**Şifreleme Algoritması**: AES-256-CBC
+
+**Kod**: `utils/crypto.js`
+
+```javascript
+const { encryptCookie, decryptCookie } = require('./utils/crypto');
+
+// Şifreleme
+const encryptedIP = encryptCookie('139.28.176.106');
+// Çıktı: "iv_base64:encrypted_data_base64"
+
+// Şifre çözme
+const decryptedIP = decryptCookie(encryptedIP);
+// Çıktı: "139.28.176.106"
+```
+
+### Secret Key Yönetimi
+
+**Ortam Değişkeni**: `.env` dosyasından `COOKIE_SECRET` okunur
+
+```env
+COOKIE_SECRET=your-very-long-random-secret-key-minimum-32-characters-required
+```
+
+**Fallback**: `.env` dosyası yoksa veya secret çok kısa ise varsayılan secret kullanılır (production'da kullanılmamalı)
+
+**Key Türetme**: SHA-256 hash ile 32 byte key türetilir
+
+```javascript
+function deriveKey(secret) {
+    return crypto.createHash('sha256').update(secret).digest();
+}
+```
+
+### Cookie Formatı
+
+**Şifreli Cookie Formatı**: `iv_base64:encrypted_data_base64`
+
+- **IV (Initialization Vector)**: Her şifreleme için rastgele 16 byte IV kullanılır
+- **Encrypted Data**: Base64 kodlanmış şifreli veri
+
+---
+
+## ⚡ Proof of Work (PoW)
+
+### Genel Bakış
+
+Proof of Work, bot ve otomatik saldırıları önlemek için kullanıcının CPU hesaplama gücü ister.
+
+### PoW Mekanizması
+
+**Challenge**: 8 karakterlik rastgele string
+
+**Hedef**: SHA-256 hash'in ilk 4 karakteri `0000` olmalı
+
+**Çözüm**: `nonce` değeri bulunur
+
+### Kod Yapısı
+
+**Client-side** (`views/js.ejs`):
+
+```javascript
+// Challenge oluştur
+var powChallenge = generatePoWChallenge(); // 8 karakter
+
+// PoW çöz
+async function solvePoWAsync(challenge) {
+    var nonce = 0;
+    while (nonce < 1000000) {
+        var hash = await sha256(challenge + nonce);
+        if (hash.startsWith('0000')) {
+            return {
+                challenge: challenge,
+                nonce: nonce,
+                hash: hash,
+                time: (Date.now() - startTime) / 1000
+            };
+        }
+        nonce++;
+    }
+    return null;
+}
+```
+
+**Server-side Validation** (`validate.js`):
+
+```javascript
+// PoW doğrulama
+if (proofOfWork) {
+    const expectedHash = await sha256(proofOfWork.challenge + proofOfWork.nonce);
+    if (expectedHash.startsWith('0000')) {
+        // PoW geçerli
+        if (proofOfWork.time < 0.1) {
+            botScore += 20; // Çok hızlı çözüm (şüpheli)
+        }
+    } else {
+        botScore += 50; // Geçersiz PoW
+    }
+} else {
+    botScore += 100; // PoW eksik
+}
+```
+
+### PoW Skorlama
+
+- **PoW eksik**: +100 puan
+- **Geçersiz PoW**: +50 puan
+- **Çok hızlı çözüm (<0.1s)**: +20 puan (bot olabilir)
+
+---
+
+## 🤖 Bot Detection ve Scoring
+
+### Bot Skorlama Sistemi
+
+Her validation isteği için **0-100** arası bir bot skoru hesaplanır.
+
+**Dosya**: `validate.js` → `calculateBotScore(validationData)`
+
+### Skorlama Kriterleri
+
+| Kriter | Puan | Açıklama |
+|--------|------|----------|
+| `webdriver: true` | +50 | Otomasyon tespit edildi |
+| `headless: true` | +40 | Headless browser tespit edildi |
+| `mouseMovements < 3` | +30 | Yetersiz mouse hareketi |
+| `proofOfWork` eksik | +100 | PoW yapılmadı |
+| PoW çok hızlı (<0.1s) | +20 | Şüpheli hızlı çözüm |
+| Geçersiz PoW | +50 | PoW doğrulanamadı |
+| `selenium: true` | +60 | Selenium tespit edildi |
+| `puppeteer: true` | +60 | Puppeteer tespit edildi |
+| `honeypotFilled: true` | +80 | Honeypot dolduruldu |
+| `userAgent` eksik | +25 | User agent yok |
+
+### Skor Kategorileri
+
+- **0-69**: Normal kullanıcı ✅
+- **70-89**: Şüpheli kullanıcı ⚠️ (log'lanır)
+- **90-100**: Yüksek şüpheli / Bot 🚫 (CAPTCHA gösterilir)
+
+### Validation Response
+
+```javascript
+{
+    valid: true,
+    botScore: 50,
+    requiresCaptcha: false,
+    reason: "Validation passed"
+}
+```
+
+**Bot Score > 90** ise:
+
+```javascript
+{
+    valid: true,
+    botScore: 95,
+    requiresCaptcha: true,
+    reason: "Bot score too high, CAPTCHA required"
+}
+```
+
+---
+
+## 🛡️ CAPTCHA Fallback
+
+### Genel Bakış
+
+Bot score > 90 ise kullanıcıya hCaptcha gösterilir.
+
+### Çalışma Mantığı
+
+1. Kullanıcı `js.ejs` sayfasından geçer
+2. PoW çözülür ve `/api/validate` endpoint'ine gönderilir
+3. Bot score hesaplanır
+4. **Bot score > 90** ise:
+   - `/api/validate` response'unda `requiresCaptcha: true` döner
+   - `js.ejs` sayfası `/captcha` sayfasına yönlendirir
+5. Kullanıcı CAPTCHA'yı çözer
+6. Token `/api/validate-captcha` endpoint'ine gönderilir
+7. Başarılı ise bypass cookie'leri set edilir
+
+### CAPTCHA Sayfası
+
+**Dosya**: `views/captcha.ejs`
+
+**Özellikler**:
+- hCaptcha widget entegrasyonu
+- Token gönderimi
+- Başarılı doğrulama sonrası ana sayfaya yönlendirme
+
+### API Endpoint
+
+**POST `/api/validate-captcha`**
+
+```javascript
+{
+    token: "hcaptcha_token_here"
+}
+```
+
+**Response**:
+```javascript
+{
+    success: true,
+    message: "CAPTCHA doğrulandı"
+}
+```
+
+---
+
 ## 📊 API Endpoints
 
 ### Endpoint: `GET /api/get-ip`
@@ -336,16 +588,48 @@ async function checkASNMiddleware(req, res, next) {
 ```
 
 **Kullanım**: 
-- `js.ejs` sayfasında cookie set edilirken senkron olarak çağrılır
-- XMLHttpRequest (senkron) kullanılır (cookie set edilmeden yönlendirme yapılmasını önlemek için)
+- `js.ejs` sayfasında cookie set edilirken **asenkron** olarak çağrılır
+- `fetch` API kullanılır (3 saniye timeout)
+- Server-side'da HttpOnly cookie'ler set edilir
 
 **Kod Örneği**:
 ```javascript
-var xhr = new XMLHttpRequest();
-xhr.open('GET', '/api/get-ip', false); // false = senkron
-xhr.send();
-var data = JSON.parse(xhr.responseText);
-// IP ve ASN cookie'leri set edilir
+// Asenkron fetch (js.ejs)
+async function setCookie() {
+    try {
+        const response = await fetch('/api/get-ip', {
+            method: 'GET',
+            credentials: 'include',
+            timeout: 3000
+        });
+        const data = await response.json();
+        // Server-side cookie'ler otomatik set edilir
+    } catch(e) {
+        console.warn('IP bilgisi alınamadı:', e);
+    }
+}
+```
+
+**Server-side Cookie Set**:
+```javascript
+// index.js - /api/get-ip endpoint
+res.cookie('asn_bypass', '1', {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'Lax'
+});
+
+res.cookie('asn_bypass_ip', encryptedIP, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'Lax'
+});
+
+res.cookie('asn_bypass_asn', encryptedASN, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'Lax'
+});
 ```
 
 ### Endpoint: `POST /api/validate`
@@ -405,7 +689,7 @@ function validateBrowserData(validationData) {
 
 ---
 
-## ⚡ Rate Limiting
+## ⚡ Rate Limiting ve Cache
 
 ### ASN Lookup Rate Limiting
 
@@ -413,17 +697,200 @@ function validateBrowserData(validationData) {
 
 **Mekanizma**:
 - Request'ler arası **1 saniye** bekleme
-- Her IP için **24 saat** cache
+- Her IP için **24 saat** cache (LRU Cache)
 - **2 saniye** timeout
 - **429 (Too Many Requests)** hataları sessizce ignore edilir
 
-### Cache Yapısı
+### LRU Cache Yapısı
+
+**Dosya**: `utils/cache.js`
 
 ```javascript
-const asnCache = new Map(); // { ip: { asn: string, timestamp: number } }
-const ASN_CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 saat
-const ASN_RATE_LIMIT_DELAY = 1000; // 1 saniye
+const { LRUCache } = require('lru-cache');
+
+const asnCache = new LRUCache({
+    max: 10000,           // Maksimum 10.000 entry
+    ttl: 24 * 60 * 60 * 1000, // 24 saat TTL
+    updateAgeOnGet: false,
+    updateAgeOnHas: false
+});
 ```
+
+**Fonksiyonlar**:
+- `getASNCache(ip)`: Cache'den ASN bilgisi al
+- `setASNCache(ip, asn)`: Cache'e ASN bilgisi kaydet
+- `hasASNCache(ip)`: Cache'de var mı kontrol et
+- `clearASNCache()`: Cache'i temizle
+- `getASNCacheStats()`: Cache istatistikleri
+
+**Avantajlar**:
+- Bellek sızıntısı önleme (eski entry'ler otomatik silinir)
+- Performans iyileştirme (10.000 entry'e kadar hızlı erişim)
+- TTL desteği (24 saat sonra otomatik expire)
+
+---
+
+## 📝 Log Rotasyonu
+
+### Genel Bakış
+
+`logs.json` dosyası maksimum **1000 kayıt** tutar. Yeni kayıt eklendiğinde en eski kayıtlar otomatik silinir.
+
+### Kod Yapısı
+
+**Dosya**: `utils/logs.js`
+
+```javascript
+function pushLog(logEntry) {
+    try {
+        let logs = [];
+        if (fs.existsSync(LOGS_FILE)) {
+            logs = JSON.parse(fs.readFileSync(LOGS_FILE, 'utf8'));
+        }
+        
+        logs.push({
+            ...logEntry,
+            timestamp: new Date().toISOString()
+        });
+        
+        // Maksimum 1000 kayıt tut
+        if (logs.length > 1000) {
+            logs = logs.slice(-1000); // En son 1000 kayıt
+        }
+        
+        fs.writeFileSync(LOGS_FILE, JSON.stringify(logs, null, 2));
+    } catch (error) {
+        console.error('Log yazma hatası:', error);
+    }
+}
+```
+
+### Log Formatı
+
+```json
+[
+    {
+        "timestamp": "2025-11-03T14:58:52.659Z",
+        "ip": "104.23.162.132",
+        "userAgent": "Mozilla/5.0...",
+        "valid": true,
+        "botScore": 50,
+        "reason": "Validation passed"
+    }
+]
+```
+
+---
+
+## 🌐 Güvenli IP Tespiti
+
+### Genel Bakış
+
+Güvenilir proxy'lerden (Cloudflare, Nginx) gelen IP'ler doğru şekilde tespit edilir ve `x-forwarded-for` manipülasyonu önlenir.
+
+### Kod Yapısı
+
+**Dosya**: `utils/ip.js`
+
+```javascript
+function getClientIP(req, customTrustedProxies = []) {
+    // 1. Cloudflare IP (öncelikli)
+    if (req.headers['cf-connecting-ip']) {
+        return cleanIP(req.headers['cf-connecting-ip']);
+    }
+    
+    // 2. Nginx Real IP
+    if (req.headers['x-real-ip']) {
+        return cleanIP(req.headers['x-real-ip']);
+    }
+    
+    // 3. X-Forwarded-For (güvenilir proxy'lerden)
+    const xForwardedFor = req.headers['x-forwarded-for'];
+    if (xForwardedFor) {
+        const ips = xForwardedFor.split(',').map(ip => ip.trim());
+        // İlk IP'yi al (en güvenilir)
+        return cleanIP(ips[0]);
+    }
+    
+    // 4. Direkt IP
+    return cleanIP(req.connection?.remoteAddress || req.socket?.remoteAddress);
+}
+
+function cleanIP(ip) {
+    // IPv6 mapped IPv4 temizleme (::ffff:)
+    if (ip && ip.startsWith('::ffff:')) {
+        return ip.substring(7);
+    }
+    return ip;
+}
+```
+
+### Proxy Desteği
+
+- ✅ **Cloudflare**: `cf-connecting-ip` header'ı öncelikli kontrol edilir
+- ✅ **Nginx**: `x-real-ip` header'ı kontrol edilir
+- ✅ **X-Forwarded-For**: Sadece ilk IP alınır (manipülasyon önleme)
+
+### IPv6 Desteği
+
+IPv6 mapped IPv4 adresleri (`::ffff:192.168.1.1`) otomatik temizlenir.
+
+---
+
+## 🔄 Otomatik ASN Güncelleme
+
+### Genel Bakış
+
+Her gün 02:00'de `bad_asns.json` dosyası otomatik güncellenir.
+
+### Cron Job
+
+**Dosya**: `cron/update-asn.js`
+
+```javascript
+async function updateBadASNList() {
+    try {
+        const response = await axios.get('https://api.bad-asn.com/list.json', {
+            timeout: 10000
+        });
+        
+        const newASNs = response.data;
+        
+        // Validasyon: En az 500 ASN olmalı
+        if (Array.isArray(newASNs) && newASNs.length > 500) {
+            fs.writeFileSync(BAD_ASNS_FILE, JSON.stringify(newASNs, null, 2));
+            console.log(`✅ Bad ASN listesi güncellendi: ${newASNs.length} ASN`);
+            return true;
+        } else {
+            console.warn('⚠️ Yeni ASN listesi geçersiz, eski liste korunuyor');
+            return false;
+        }
+    } catch (error) {
+        console.error('❌ ASN listesi güncellenemedi:', error.message);
+        return false;
+    }
+}
+```
+
+### Cron Schedule
+
+**Dosya**: `index.js`
+
+```javascript
+const cron = require('node-cron');
+
+// Her gün 02:00'de çalıştır
+cron.schedule('0 2 * * *', async () => {
+    console.log('🔄 Bad ASN listesi güncelleniyor...');
+    await updateBadASNList();
+});
+```
+
+### Hata Durumu
+
+- API'den veri alınamazsa: Eski liste korunur
+- Yeni liste geçersizse (<500 ASN): Eski liste korunur
+- Hata loglanır ancak sistem çalışmaya devam eder
 
 ---
 
@@ -549,36 +1016,49 @@ var fallbackTimeout = 10000; // 10 saniye
 ```
 akarstresserdiscordbot/
 ├── index.js              # Ana server, middleware, routes
-├── validate.js           # Validation fonksiyonları
-├── bad_asns.json        # Bad ASN listesi
-├── logs.json            # Validation logları
-├── views/
-│   └── js.ejs           # Güvenlik doğrulama sayfası
-└── .htaccess            # URL rewriting ve erişim kontrolü
+├── validate.js           # Browser validation ve bot scoring
+├── bad_asns.json        # Bad ASN listesi (600+ ASN)
+├── logs.json            # Validation logları (max 1000 kayıt)
+├── .env                 # Ortam değişkenleri (COOKIE_SECRET)
+├── .htaccess            # URL rewriting ve erişim kontrolü
+├── utils/
+│   ├── crypto.js        # AES-256 cookie şifreleme
+│   ├── ip.js            # Güvenli IP tespiti
+│   ├── cache.js         # LRU cache (ASN cache)
+│   └── logs.js          # Log rotasyonu (max 1000 kayıt)
+├── cron/
+│   └── update-asn.js    # Günlük ASN listesi güncelleme
+└── views/
+    ├── js.ejs           # Güvenlik doğrulama sayfası (PoW, bot detection)
+    └── captcha.ejs      # CAPTCHA fallback sayfası
 ```
 
 ---
 
 ## 🚀 Geliştirme Notları
 
-### Yeni Özellikler (Son Güncelleme)
+### Yeni Özellikler (v3.0 - Son Güncelleme)
 
-1. ✅ **IP Takibi**: Her kullanıcının IP'si cookie'de saklanıyor
-2. ✅ **ASN Takibi**: Her kullanıcının ASN'i cookie'de saklanıyor
-3. ✅ **IP Değişikliği Kontrolü**: IP değiştiğinde otomatik yeniden doğrulama
-4. ✅ **ASN Değişikliği Kontrolü**: ASN değiştiğinde otomatik yeniden doğrulama
-5. ✅ **Session Cookie**: Cookie'ler tarayıcı kapanana kadar geçerli
-6. ✅ **VPN Tespiti**: Bad ASN tespit edildiğinde cookie'ler temizleniyor
-7. ✅ **Senkron IP Alma**: Cookie set edilmeden yönlendirme yapılmasını önler
+1. ✅ **Cookie Güvenliği**: HttpOnly, Secure flag'leri ve AES-256 şifreleme
+2. ✅ **Proof of Work (PoW)**: 8 karakterlik hash bulmacası (4 sıfır başlangıç)
+3. ✅ **Bot Detection**: Browser fingerprinting ve bot scoring sistemi (0-100)
+4. ✅ **CAPTCHA Fallback**: Bot score > 90 ise hCaptcha gösterilir
+5. ✅ **LRU Cache**: ASN cache'i LRU cache'e taşındı (max 10.000 entry, TTL 24 saat)
+6. ✅ **Log Rotasyonu**: `logs.json` maksimum 1000 kayıt tutar
+7. ✅ **Güvenli IP Tespiti**: Cloudflare, Nginx proxy desteği, `x-forwarded-for` manipülasyonu önleme
+8. ✅ **Otomatik ASN Güncelleme**: Her gün 02:00'de `bad_asns.json` otomatik güncellenir (cron job)
+9. ✅ **IPv6 Desteği**: IPv6 mapped IPv4 adresleri (`::ffff:`) otomatik temizlenir
+10. ✅ **Private IP Bypass Kısıtlaması**: Sadece `127.0.0.1` ve `::1` bypass, diğer private IP'ler kontrol edilir
+11. ✅ **Asenkron Cookie Set**: `/api/get-ip` endpoint'i asenkron fetch ile çağrılır (3 saniye timeout)
 
 ### Gelecek İyileştirmeler
 
-1. **CAPTCHA Entegrasyonu**: Şüpheli kullanıcılar için CAPTCHA
-2. **Geolocation Kontrolü**: IP konumuna göre filtreleme
-3. **Rate Limiting**: Per-IP request limit
-4. **Honeypot Geliştirme**: Daha gelişmiş bot detection
-5. **Machine Learning**: Anormal trafik tespiti
-6. **Cookie Encryption**: Cookie'lerdeki IP/ASN bilgilerini şifreleme
+1. **Geolocation Kontrolü**: IP konumuna göre filtreleme
+2. **Rate Limiting**: Per-IP request limit
+3. **Machine Learning**: Anormal trafik tespiti
+4. **Redis Entegrasyonu**: ASN cache'i Redis'e taşınabilir
+5. **Database Entegrasyonu**: Bad ASN listesi database'de saklanabilir
+6. **Real-time Monitoring**: Canlı trafik izleme dashboard'u
 
 ### Performans Optimizasyonları
 
@@ -597,14 +1077,29 @@ Sorularınız için:
 
 ---
 
-**Son Güncelleme**: 2024  
-**Versiyon**: 2.0
+**Son Güncelleme**: 2025 Ekim 3  
+**Versiyon**: 3.0
 
 ---
 
 ## 📝 Versiyon Notları
 
-### v2.0 (2024)
+### v3.0 (2025 Ekim 3)
+- ✅ **Cookie Güvenliği**: HttpOnly, Secure flag'leri ve AES-256 şifreleme eklendi
+- ✅ **Proof of Work (PoW)**: 8 karakterlik hash bulmacası (4 sıfır başlangıç) eklendi
+- ✅ **Bot Detection**: Browser fingerprinting ve bot scoring sistemi (0-100) eklendi
+- ✅ **CAPTCHA Fallback**: Bot score > 90 ise hCaptcha gösterilir
+- ✅ **LRU Cache**: ASN cache'i `lru-cache` paketine taşındı (max 10.000 entry, TTL 24 saat)
+- ✅ **Log Rotasyonu**: `logs.json` maksimum 1000 kayıt tutar (en eskileri silinir)
+- ✅ **Güvenli IP Tespiti**: Cloudflare, Nginx proxy desteği, `x-forwarded-for` manipülasyonu önleme
+- ✅ **Otomatik ASN Güncelleme**: Her gün 02:00'de `bad_asns.json` otomatik güncellenir (`node-cron`)
+- ✅ **IPv6 Desteği**: IPv6 mapped IPv4 adresleri (`::ffff:`) otomatik temizlenir
+- ✅ **Private IP Bypass Kısıtlaması**: Sadece `127.0.0.1` ve `::1` bypass
+- ✅ **Asenkron Cookie Set**: `/api/get-ip` endpoint'i asenkron fetch ile çağrılır (3 saniye timeout)
+- ✅ **Utility Modülleri**: `utils/crypto.js`, `utils/ip.js`, `utils/cache.js`, `utils/logs.js` eklendi
+- ✅ **Cron Job Modülü**: `cron/update-asn.js` eklendi
+
+### v2.0 (2025 - Geçmiş Versiyon)
 - ✅ IP ve ASN cookie takibi eklendi
 - ✅ IP değişikliği kontrolü eklendi
 - ✅ ASN değişikliği kontrolü eklendi
@@ -613,7 +1108,7 @@ Sorularınız için:
 - ✅ `/api/get-ip` endpoint'i eklendi
 - ✅ Senkron IP alma mekanizması
 
-### v1.0 (2024)
+### v1.0 (2025 - Geçmiş Versiyon)
 - ✅ ASN tabanlı filtreleme
 - ✅ Bad ASN veritabanı
 - ✅ Güvenlik doğrulama sayfası (js.ejs)
